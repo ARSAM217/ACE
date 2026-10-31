@@ -20,6 +20,61 @@ let env = {};
 // Read local .env only for development; Render environment variables take precedence.
 try { for (const line of fs.readFileSync(path.join(ROOT,'.env'),'utf8').split(/\r?\n/)) { const m=line.match(/^\s*([A-Za-z_]+)\s*=\s*(.*)\s*$/); if(m) env[m[1]]=m[2].replace(/^['"]|['"]$/g,''); } } catch {}
 const cfg = k => process.env[k] || env[k];
+
+// SMS.ir OTP helpers
+function normalizeIranMobile(value) {
+  let phone = String(value || '').replace(/[۰-۹٠-٩]/g, d =>
+    String('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩'.indexOf(d) % 10)
+  ).replace(/[\s()-]/g, '');
+  if (phone.startsWith('+98')) phone = '0' + phone.slice(3);
+  else if (phone.startsWith('0098')) phone = '0' + phone.slice(4);
+  else if (phone.startsWith('98') && phone.length === 12) phone = '0' + phone.slice(2);
+  return /^09\d{9}$/.test(phone) ? phone : null;
+}
+
+function createOtpState(phone, code) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.createHash('sha256').update(salt + ':' + code).digest('hex');
+  return { phone, salt, hash, expiresAt: Date.now() + 5 * 60 * 1000, attempts: 0, sentAt: Date.now() };
+}
+
+function verifyOtpState(state, code) {
+  if (!state || Date.now() > Number(state.expiresAt || 0)) return { ok: false, reason: 'کد تأیید منقضی شده است.' };
+  if (Number(state.attempts || 0) >= 5) return { ok: false, reason: 'تعداد تلاش‌ها بیش از حد مجاز است؛ دوباره کد بگیر.' };
+  state.attempts = Number(state.attempts || 0) + 1;
+  const hash = crypto.createHash('sha256').update(state.salt + ':' + String(code || '').trim()).digest();
+  const expected = Buffer.from(state.hash, 'hex');
+  const ok = expected.length === hash.length && crypto.timingSafeEqual(expected, hash);
+  return ok ? { ok: true } : { ok: false, reason: 'کد تأیید اشتباه است.' };
+}
+
+async function sendSmsIrOtp(phone, code) {
+  const apiKey = cfg('SMSIR_API_KEY');
+  const templateId = Number(cfg('SMSIR_TEMPLATE_ID'));
+  const parameter = cfg('SMSIR_OTP_PARAMETER') || 'CODE';
+  if (!apiKey || !Number.isInteger(templateId) || templateId <= 0) {
+    throw new Error('تنظیمات پیامک SMS.ir در سرور کامل نیست.');
+  }
+  const response = await fetch('https://api.sms.ir/v1/send/verify', {
+    method: 'POST',
+    headers: { 'x-api-key': apiKey, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({
+      mobile: phone,
+      templateId,
+      parameters: [{ name: parameter, value: String(code) }]
+    }),
+    signal: AbortSignal.timeout(15000)
+  });
+  const raw = await response.text();
+  let result = {};
+  try { result = raw ? JSON.parse(raw) : {}; } catch {}
+  if (!response.ok) {
+    console.error('SMS.ir request failed:', response.status, result?.message || 'provider error');
+    throw new Error('ارسال پیامک انجام نشد؛ تنظیمات یا اعتبار پنل پیامک را بررسی کن.');
+  }
+  return result;
+}
+
 const PORT = Number(cfg('PORT') || 1074);
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error('PORT must be an integer from 1 to 65535');
 const dataDir = path.dirname(path.resolve(ROOT, cfg('DATABASE_PATH') || path.join(ROOT,'data','dordor.sqlite')));
@@ -279,7 +334,7 @@ const requireAuth = (req,res,next) => { if(!req.session?.uid)return res.status(4
 
 const enforceRestriction=(type)=> (req,res,next)=>{if(!req.user)return next();const r=db.prepare("SELECT restriction_type,ends_at,reason FROM user_restrictions WHERE user_id=? AND active=1 AND ends_at>CURRENT_TIMESTAMP AND restriction_type IN (?, 'app') ORDER BY CASE restriction_type WHEN 'app' THEN 0 ELSE 1 END LIMIT 1").get(req.user.id,type);if(r)return res.status(403).json({error:`این قابلیت تا ${new Date(r.ends_at).toLocaleString('fa-IR')} محدود شده است. علت: ${r.reason}`,restriction:true,endsAt:r.ends_at});next();};
 // Maintenance mode is enforced server-side as well as in the client. Owner/creator retain full access.
-app.use('/api',(req,res,next)=>{if(getSetting('maintenance')!=='1')return next();const allowed=['/config','/me','/maintenance/status','/auth/login','/auth/register','/logo'];if(allowed.includes(req.path))return next();const u=req.session?.uid?userById(Number(req.session.uid)):null;if(u&&['owner','creator'].includes(u.role))return next();return res.status(503).json({error:'ایس کلاب در حال بروزرسانی است؛ لطفاً کمی بعد دوباره تلاش کنید.',maintenance:true});});
+app.use('/api',(req,res,next)=>{if(getSetting('maintenance')!=='1')return next();const allowed=['/config','/me','/maintenance/status','/auth/login','/auth/register','/auth/register-otp/send','/auth/register-otp/verify','/security/status','/security/phone-otp/send-old','/security/phone-otp/verify-old','/security/phone-otp/send-new','/security/phone-otp/verify-new','/logo'];if(allowed.includes(req.path))return next();const u=req.session?.uid?userById(Number(req.session.uid)):null;if(u&&['owner','creator'].includes(u.role))return next();return res.status(503).json({error:'ایس کلاب در حال بروزرسانی است؛ لطفاً کمی بعد دوباره تلاش کنید.',maintenance:true});});
 app.use('/api',(req,res,next)=>{const allowed=['/config','/me','/auth/logout','/maintenance/status'];if(allowed.includes(req.path)||!req.session?.uid)return next();const r=db.prepare("SELECT ends_at,reason FROM user_restrictions WHERE user_id=? AND restriction_type='app' AND active=1 AND ends_at>CURRENT_TIMESTAMP ORDER BY id DESC LIMIT 1").get(Number(req.session.uid));if(r)return res.status(403).json({error:`کل برنامه تا ${new Date(r.ends_at+'Z').toLocaleString('fa-IR')} محدود شده است. علت: ${r.reason}`,restriction:true,endsAt:r.ends_at});next();});
 
 // Block list and block enforcement; all mutations are authenticated and target IDs are validated.
@@ -672,9 +727,35 @@ app.patch('/api/profile',requireAuth,enforceRestriction('profile'),(req,res)=>{c
 app.get('/api/rewards/daily',requireAuth,(req,res)=>{const row=db.prepare('SELECT claimed_at FROM daily_presence_rewards WHERE user_id=?').get(req.user.id);const nowIran=iranClock(),today=iranKey(nowIran),claimedIran=row?iranKey(new Date(Number(row.claimed_at)*1000+210*60000)):'';const nextMidnight=Date.UTC(nowIran.getUTCFullYear(),nowIran.getUTCMonth(),nowIran.getUTCDate()+1)-210*60000;const remaining=claimedIran===today?Math.max(0,Math.ceil((nextMidnight-Date.now())/1000)):0;res.json({available:remaining===0,remainingSeconds:remaining,amount:100,fame:100});});
 app.post('/api/rewards/daily/claim',requireAuth,(req,res)=>{const now=Math.floor(Date.now()/1000);const row=db.prepare('SELECT claimed_at FROM daily_presence_rewards WHERE user_id=?').get(req.user.id);const nowIran=iranClock(),today=iranKey(nowIran),claimedIran=row?iranKey(new Date(Number(row.claimed_at)*1000+210*60000)):'';if(claimedIran===today)return res.status(429).json({error:'جایزه ورود امروز را قبلاً دریافت کرده‌ای؛ فردا دوباره سر بزن'});db.prepare('INSERT INTO daily_presence_rewards(user_id,claimed_at) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET claimed_at=excluded.claimed_at').run(req.user.id,now);addTx(req.user.id,100,'presence_reward','جایزه ورود روزانه');syncUserFameAndLevel(req.user.id,{fame:Math.max(0,Number(userById(req.user.id)?.fame||0))+100});notify(req.user.id,'جایزه ورود روزانه','۱۰۰ سکه و ۱۰۰ شهرت جایزه ورود روزانه به حسابت اضافه شد.');res.json({ok:true,amount:100,fame:100,user:safeUser(userById(req.user.id))});});
 app.get('/api/config',(req,res)=>res.json({rtc:{iceServers:[{urls:'stun:stun.l.google.com:19302'},...(cfg('TURN_URL')&&cfg('TURN_USERNAME')&&cfg('TURN_CREDENTIAL')?[{urls:cfg('TURN_URL'),username:cfg('TURN_USERNAME'),credential:cfg('TURN_CREDENTIAL')}]:[])]},appName:getSetting('app_name'),maintenance:getSetting('maintenance')==='1',economy:{pro_cost:Number(getSetting('pro_cost')),boost_cost:Number(getSetting('boost_cost')),unlock_cost:Number(getSetting('unlock_cost')),direct_cost:Number(getSetting('direct_cost')),message_request_cost:Number(getSetting('message_request_cost')),pro_chat_requests:Number(getSetting('pro_chat_requests')),pro_quota_8h:Number(getSetting('pro_quota_8h')),pro_quota_24h:Number(getSetting('pro_quota_24h')),pro_quota_7d:Number(getSetting('pro_quota_7d')),free_message_quota:Number(getSetting('free_message_quota')||10),diamond_coin_rate:Number(getSetting('diamond_coin_rate')),diamond_transfer_min:Number(getSetting('diamond_transfer_min')),level_diamond_reward:Number(getSetting('level_diamond_reward')),game_daily_reward_1:Number(getSetting('game_daily_reward_1')),game_daily_reward_2:Number(getSetting('game_daily_reward_2')),game_daily_reward_3:Number(getSetting('game_daily_reward_3')),coin_packs:[1,2,3,4].map(i=>({id:i,coins:Number(getSetting('coin_pack_'+i+'_coins')),diamonds:Number(getSetting('coin_pack_'+i+'_diamonds'))}))}}));
+// Registration SMS verification
+app.post('/api/auth/register-otp/send', async (req,res)=>{
+ const phone=normalizeIranMobile(req.body?.phone);
+ if(!phone)return res.status(400).json({error:'شماره موبایل معتبر با فرمت 09xxxxxxxxx وارد کنید'});
+ if(db.prepare('SELECT id FROM users WHERE phone=?').get(phone))return res.status(409).json({error:'این شماره قبلاً ثبت شده است'});
+ const previous=req.session.registerOtp;
+ if(previous && Date.now()-Number(previous.sentAt||0)<60000)return res.status(429).json({error:'برای ارسال دوباره کد، یک دقیقه صبر کن.'});
+ const code=String(crypto.randomInt(10000,100000));
+ try {
+  await sendSmsIrOtp(phone,code);
+  req.session.registerOtp=createOtpState(phone,code);
+  res.json({ok:true,message:'کد تأیید ارسال شد.',expiresIn:300,resendAfter:60});
+ } catch(e) { res.status(502).json({error:e.message||'ارسال پیامک ناموفق بود.'}); }
+});
+app.post('/api/auth/register-otp/verify',(req,res)=>{
+ const state=req.session.registerOtp;
+ if(!state)return res.status(400).json({error:'ابتدا کد تأیید را درخواست کن.'});
+ const result=verifyOtpState(state,req.body?.code);
+ if(!result.ok){if(Date.now()>Number(state.expiresAt||0)||state.attempts>=5)delete req.session.registerOtp;return res.status(400).json({error:result.reason});}
+ req.session.registrationPhoneVerified=state.phone;
+ delete req.session.registerOtp;
+ res.json({ok:true,verified:true});
+});
+
 app.post('/api/auth/register', (req,res)=>{
  const {username,password,display_name,phone,invite_code,gender,age,province}=req.body||{};
- const phoneNormalized=String(phone||'').replace(/[۰-۹٠-٩]/g,d=>String('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩'.indexOf(d)%10)).replace(/[\s()-]/g,'').slice(0,30)||null;
+ const phoneNormalized=phone ? normalizeIranMobile(phone) : null;
+ if(phone && !phoneNormalized)return res.status(400).json({error:'شماره موبایل معتبر با فرمت 09xxxxxxxxx وارد کنید'});
+ if(phoneNormalized && req.session.registrationPhoneVerified!==phoneNormalized)return res.status(403).json({error:'ابتدا شماره تلفن خود را با کد پیامکی تأیید کنید'});
  if(req.body?.acceptedTerms!==true)return res.status(400).json({error:'برای ثبت‌نام باید قوانین و راهنما را مطالعه و تأیید کنید'});
  if(!/^[a-zA-Z0-9_]{3,24}$/.test(String(username||'')))return res.status(400).json({error:'نام کاربری ۳ تا ۲۴ حرف انگلیسی، عدد یا _ باشد'});
  if(String(password||'').length<8 || !/[A-Za-z]/.test(String(password||'')) || !/[0-9]/.test(String(password||'')))return res.status(400).json({error:'رمز عبور باید حداقل ۸ کاراکتر و شامل حداقل یک حرف انگلیسی و یک عدد باشد'});
@@ -683,7 +764,7 @@ app.post('/api/auth/register', (req,res)=>{
  if(userByName(username))return res.status(409).json({error:'این نام کاربری قبلاً گرفته شده'});
  if(invite_code){const inviter=userByName(String(invite_code).trim());if(!inviter)return res.status(400).json({error:'کد دعوت معتبر نیست'});if(String(inviter.username).toLowerCase()===String(username).toLowerCase())return res.status(400).json({error:'نمی‌توانی از کد دعوت خودت استفاده کنی'});}
 
- if(phone && db.prepare('SELECT id FROM users WHERE phone=?').get(phone))return res.status(409).json({error:'این شماره قبلاً ثبت شده'});
+ if(phoneNormalized && db.prepare('SELECT id FROM users WHERE phone=?').get(phoneNormalized))return res.status(409).json({error:'این شماره قبلاً ثبت شده'});
  const hash=bcrypt.hashSync(password,12);
  const priorReal=db.prepare("SELECT id FROM users WHERE username<>'OWNER' COLLATE NOCASE ORDER BY id LIMIT 1").get();
  const makeOwner=!priorReal;
@@ -691,14 +772,59 @@ app.post('/api/auth/register', (req,res)=>{
  const uid=Number(r.lastInsertRowid);if(makeOwner)db.prepare("UPDATE users SET role='user' WHERE id<>? AND role IN ('owner','creator')").run(uid);if(makeOwner)db.prepare("UPDATE chat_groups SET owner_id=? WHERE name='گروه ایس کلاب'").run(uid);
  let official=db.prepare("SELECT id FROM chat_groups WHERE group_code='ACECLUB_OFFICIAL' OR name='گروه ایس کلاب' ORDER BY CASE WHEN group_code='ACECLUB_OFFICIAL' THEN 0 ELSE 1 END,id LIMIT 1").get();if(!official&&makeOwner){const gr=db.prepare('INSERT INTO chat_groups(name,group_code,description,owner_id) VALUES(?,?,?,?)').run('گروه ایس کلاب','ACECLUB_OFFICIAL','گروه همگانی رسمی ایس کلاب',uid);official={id:Number(gr.lastInsertRowid)};}if(official)db.prepare('INSERT OR IGNORE INTO chat_group_members(group_id,user_id,role) VALUES(?,?,?)').run(official.id,uid,makeOwner?'owner':'member');if(makeOwner&&official){db.prepare("UPDATE chat_group_members SET role='member' WHERE group_id=? AND user_id<>? AND role='owner'").run(official.id,uid);db.prepare("UPDATE chat_group_members SET role='owner' WHERE group_id=? AND user_id=?").run(official.id,uid);}db.prepare('UPDATE users SET terms_accepted_at=CURRENT_TIMESTAMP WHERE id=?').run(uid);logActivity(uid,uid,'register',makeOwner?'ثبت‌نام؛ اولین حساب و سازنده سایت':'ثبت‌نام و تأیید قوانین');addTx(uid,0,'signup','ثبت نام');
  if(invite_code){const inviter=userByName(String(invite_code).trim());if(inviter&&inviter.id!==uid){const referral=db.prepare('INSERT OR IGNORE INTO referrals(inviter_id,invitee_id) VALUES(?,?)').run(inviter.id,uid);if(referral.changes){addTx(inviter.id,500,'referral','پاداش دعوت دوست '+username);addTx(uid,250,'referral_welcome','پاداش خوش‌آمدگویی از دعوت '+inviter.username);notify(inviter.id,'پاداش دعوت','۵۰۰ سکه به‌خاطر دعوت دوستت به حسابت اضافه شد.');notify(uid,'پاداش دعوت','۲۵۰ سکه به‌خاطر دعوت شدن به ایس کلاب دریافت کردی.');}}}
- recordLoginDay(uid);req.session.uid=uid;res.json({user:safeUser(userById(uid))});
+ recordLoginDay(uid);req.session.uid=uid;delete req.session.registrationPhoneVerified;delete req.session.registerOtp;res.json({user:safeUser(userById(uid))});
 });
 app.get('/api/auth/device-accounts',(req,res)=>{const did=String(req.get('X-ACE-Device-ID')||'').trim().slice(0,100);if(!did||!/^[A-Za-z0-9._:-]+$/.test(did))return res.json({accounts:[]});const accounts=db.prepare("SELECT id,username,display_name,avatar FROM users WHERE device_id=? AND is_banned=0 ORDER BY last_seen DESC,id DESC LIMIT 10").all(did);res.json({accounts});});
 app.post('/api/auth/device-login',(req,res)=>{const did=String(req.get('X-ACE-Device-ID')||'').trim().slice(0,100),id=Number(req.body.userId);if(!did||!/^[A-Za-z0-9._:-]+$/.test(did))return res.status(400).json({error:'شناسهٔ دستگاه معتبر نیست'});const u=db.prepare('SELECT * FROM users WHERE id=? AND device_id=?').get(id,did);if(!u)return res.status(403).json({error:'این حساب به شناسهٔ همین دستگاه متصل نیست'});if(u.is_banned)return res.status(403).json({error:'این حساب مسدود است'});req.session.uid=u.id;db.prepare('UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE id=?').run(u.id);recordLoginDay(u.id);logActivity(u.id,u.id,'device_quick_login','ورود سریع از فهرست حساب‌های همین دستگاه');res.json({user:safeUser(userById(u.id))});});
 app.post('/api/auth/login',(req,res)=>{const {username,password}=req.body||{};const u=userByName(String(username||''));if(!u||!bcrypt.compareSync(String(password||''),u.password_hash))return res.status(400).json({error:'نام کاربری یا رمز عبور اشتباه است'});if(u.is_banned && u.ban_until && Date.parse(u.ban_until)<=Date.now()){db.prepare('UPDATE users SET is_banned=0,ban_reason=NULL,ban_until=NULL WHERE id=?').run(u.id);u=userById(u.id);}if(u.is_banned)return res.status(403).json({error:u.ban_reason?`حساب شما مسدود شده است: ${u.ban_reason}`:'حساب شما مسدود شده است'});req.session.uid=u.id;db.prepare('UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE id=?').run(u.id);recordLoginDay(u.id);logActivity(u.id,u.id,'login','ورود به حساب');res.json({user:safeUser(userById(u.id))});});
 app.post('/api/auth/logout',requireAuth,(req,res)=>{if(!String(req.user.phone||'').trim())return res.status(400).json({error:'برای خروج از حساب، ابتدا شماره تلفن خود را در بخش امنیت ثبت کنید'});req.session.destroy(err=>{if(err)return res.status(500).json({error:'خروج از حساب انجام نشد'});res.clearCookie('dor.sid',{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production'});res.json({ok:true});});});
 app.get('/api/security/status',requireAuth,(req,res)=>res.json({hasPhone:!!req.user.phone,maskedPhone:req.user.phone?String(req.user.phone).replace(/.(?=.{4})/g,'•'):''}));
-app.patch('/api/security/phone',requireAuth,(req,res)=>{const phone=String(req.body.phone||'').trim();if(!/^\+?[0-9۰-۹٠-٩][0-9۰-۹٠-٩\s()-]{7,19}$/.test(phone))return res.status(400).json({error:'شماره تلفن معتبر وارد کنید'});const normalized=phone.replace(/[\s()-]/g,'');const exists=db.prepare('SELECT id FROM users WHERE phone=? AND id<>?').get(normalized,req.user.id);if(exists)return res.status(409).json({error:'این شماره قبلاً برای حساب دیگری ثبت شده است'});db.prepare('UPDATE users SET phone=? WHERE id=?').run(normalized,req.user.id);res.json({ok:true,maskedPhone:normalized.replace(/.(?=.{4})/g,'•')});});
+app.post('/api/security/phone-otp/send-old',requireAuth,async(req,res)=>{
+ const u=userById(req.user.id);
+ if(!u?.phone)return res.status(400).json({error:'این حساب شماره قبلی ندارد؛ شماره جدید را ثبت کن.'});
+ const previous=req.session.phoneChangeOldOtp;
+ if(previous && Date.now()-Number(previous.sentAt||0)<60000)return res.status(429).json({error:'برای ارسال دوباره کد، یک دقیقه صبر کن.'});
+ const code=String(crypto.randomInt(10000,100000));
+ try { await sendSmsIrOtp(u.phone,code);req.session.phoneChangeOldOtp=createOtpState(u.phone,code);res.json({ok:true,message:'کد تأیید به شماره فعلی ارسال شد.',expiresIn:300,resendAfter:60}); }
+ catch(e){res.status(502).json({error:e.message||'ارسال پیامک ناموفق بود.'});}
+});
+app.post('/api/security/phone-otp/verify-old',requireAuth,(req,res)=>{
+ const state=req.session.phoneChangeOldOtp;
+ if(!state)return res.status(400).json({error:'ابتدا کد شماره فعلی را درخواست کن.'});
+ const current=userById(req.user.id);
+ if(!current?.phone||current.phone!==state.phone){delete req.session.phoneChangeOldOtp;return res.status(400).json({error:'شماره فعلی حساب تغییر کرده است؛ دوباره تلاش کن.'});}
+ const result=verifyOtpState(state,req.body?.code);
+ if(!result.ok){if(Date.now()>Number(state.expiresAt||0)||state.attempts>=5)delete req.session.phoneChangeOldOtp;return res.status(400).json({error:result.reason});}
+ req.session.phoneChangeOldVerified=true;
+ delete req.session.phoneChangeOldOtp;
+ res.json({ok:true,verified:true});
+});
+app.post('/api/security/phone-otp/send-new',requireAuth,async(req,res)=>{
+ const current=userById(req.user.id);
+ if(current?.phone&&!req.session.phoneChangeOldVerified)return res.status(403).json({error:'برای تغییر شماره، ابتدا شماره فعلی را تأیید کن.'});
+ const phone=normalizeIranMobile(req.body?.phone);
+ if(!phone)return res.status(400).json({error:'شماره موبایل معتبر با فرمت 09xxxxxxxxx وارد کنید'});
+ if(current?.phone===phone)return res.status(400).json({error:'این شماره همین حالا روی حساب ثبت شده است.'});
+ if(db.prepare('SELECT id FROM users WHERE phone=? AND id<>?').get(phone,req.user.id))return res.status(409).json({error:'این شماره قبلاً برای حساب دیگری ثبت شده است'});
+ const previous=req.session.phoneChangeNewOtp;
+ if(previous && Date.now()-Number(previous.sentAt||0)<60000)return res.status(429).json({error:'برای ارسال دوباره کد، یک دقیقه صبر کن.'});
+ const code=String(crypto.randomInt(10000,100000));
+ try { await sendSmsIrOtp(phone,code);req.session.phoneChangeNewOtp=createOtpState(phone,code);res.json({ok:true,message:'کد تأیید به شماره جدید ارسال شد.',expiresIn:300,resendAfter:60}); }
+ catch(e){res.status(502).json({error:e.message||'ارسال پیامک ناموفق بود.'});}
+});
+app.post('/api/security/phone-otp/verify-new',requireAuth,(req,res)=>{
+ const state=req.session.phoneChangeNewOtp;
+ if(!state)return res.status(400).json({error:'ابتدا کد شماره جدید را درخواست کن.'});
+ const current=userById(req.user.id);
+ if(current?.phone&&!req.session.phoneChangeOldVerified)return res.status(403).json({error:'ابتدا شماره فعلی را تأیید کن.'});
+ const result=verifyOtpState(state,req.body?.code);
+ if(!result.ok){if(Date.now()>Number(state.expiresAt||0)||state.attempts>=5)delete req.session.phoneChangeNewOtp;return res.status(400).json({error:result.reason});}
+ if(db.prepare('SELECT id FROM users WHERE phone=? AND id<>?').get(state.phone,req.user.id)){delete req.session.phoneChangeNewOtp;return res.status(409).json({error:'این شماره در این فاصله برای حساب دیگری ثبت شده است.'});}
+ db.prepare('UPDATE users SET phone=? WHERE id=?').run(state.phone,req.user.id);
+ delete req.session.phoneChangeOldOtp;delete req.session.phoneChangeOldVerified;delete req.session.phoneChangeNewOtp;
+ res.json({ok:true,maskedPhone:state.phone.replace(/.(?=.{4})/g,'•')});
+});
+app.patch('/api/security/phone',requireAuth,(req,res)=>res.status(410).json({error:'برای ثبت یا تغییر شماره، تأیید پیامکی لازم است.'}));
 app.post('/api/security/password',requireAuth,(req,res)=>{const {currentPassword,newPassword,phone}=req.body||{};const u=userById(req.user.id);if(!u.phone)return res.status(400).json({error:'ابتدا شماره تلفن خود را ثبت کنید'});if(String(phone||'').replace(/[\s()-]/g,'')!==String(u.phone).replace(/[\s()-]/g,''))return res.status(400).json({error:'شماره تلفن با شماره ثبت‌شده مطابقت ندارد'});if(!bcrypt.compareSync(String(currentPassword||''),u.password_hash))return res.status(400).json({error:'رمز عبور فعلی درست نیست'});if(String(newPassword||'').length<8)return res.status(400).json({error:'رمز جدید باید حداقل ۸ کاراکتر باشد'});if(String(newPassword)===String(currentPassword))return res.status(400).json({error:'رمز جدید باید با رمز فعلی متفاوت باشد'});db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(String(newPassword),12),u.id);res.json({ok:true});});
 app.get('/api/me',requireAuth,(req,res)=>{syncUserFameAndLevel(req.user.id);db.prepare('UPDATE users SET last_seen=CURRENT_TIMESTAMP WHERE id=?').run(req.user.id);res.json({user:safeUser(userById(req.user.id))});});
 app.get('/api/explore',requireAuth,(req,res)=>{const q=String(req.query.q||'').slice(0,50);const viewerPro=!!(req.user.pro_until&&Date.parse(req.user.pro_until)>Date.now());const users=db.prepare(`SELECT u.*,(SELECT COUNT(*) FROM likes l WHERE l.to_id=u.id) likes FROM users u WHERE u.id!=? AND u.is_banned=0 AND ((u.pro_until IS NOT NULL AND datetime(u.pro_until)>datetime('now')) OR (u.boost_until IS NOT NULL AND datetime(u.boost_until)>datetime('now'))) AND (u.username LIKE ? OR u.display_name LIKE ?) ORDER BY CASE WHEN (u.boost_until IS NOT NULL AND datetime(u.boost_until)>datetime('now')) THEN 0 ELSE 1 END, RANDOM() LIMIT 10`).all(req.user.id,'%'+q+'%','%'+q+'%').map(u=>({...safeUser(u),age:viewerPro?u.age:null,province:viewerPro?u.province:'',likes:u.likes,boosted:!!(u.boost_until&&Date.parse(u.boost_until)>Date.now()),pro:!!(u.pro_until&&Date.parse(u.pro_until)>Date.now()),liked:!!db.prepare('SELECT 1 FROM likes WHERE from_id=? AND to_id=?').get(req.user.id,u.id),following:!!db.prepare('SELECT 1 FROM follows WHERE follower_id=? AND followed_id=?').get(req.user.id,u.id)}));res.json({users});});
